@@ -4,7 +4,7 @@ set -x
 set -e
 
 # --- REPOSITORIO OFICIAL ---
-REPO_BASE_URL="https://raw.githubusercontent.com/t741712-afk/business-lab/refs/heads/main/apache"
+REPO_BASE_URL="https://raw.githubusercontent.com/t741712-afk/business-lab-ctf/refs/heads/main/apache"
 
 echo "==> Actualizando el sistema..."
 dnf -y update

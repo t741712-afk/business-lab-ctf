@@ -34,7 +34,7 @@ Parameters:
 
   ScriptBaseUrl:
     Type: String
-    Default: https://raw.githubusercontent.com/t741712-afk/business-lab/main/scripts
+    Default: https://raw.githubusercontent.com/t741712-afk/business-lab-ctf/main/scripts
     Description: URL raw del repo con los scripts de provisioning.
 
   DomainName:
