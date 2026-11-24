@@ -1,7 +1,5 @@
 # CTF Laboratories Corporation TAI: notas personales
 
-Recordatorio de lo que monta este proyecto, cómo desplegarlo y qué queda pendiente.
-Es un proyecto independiente de `business-lab`.
 
 ---
 
