@@ -1,0 +1,674 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Business-Lab CTF  ·  una VPC con dos redes:
+    * DMZ 10.0.0.0/24 (publica): Service Gateway (10.0.0.75).
+    * MZ  10.0.1.0/24 (privada, salida por NAT): controlador de dominio (10.0.1.10) y
+      conector privado ZTSA (10.0.1.16).
+  Mismas restricciones PX que el laboratorio (us-east-1, sin IAM role, IMDSv2 y EBS
+  cifrado, AMIs estandar via SSM).
+
+Parameters:
+  KeyName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Default: corp-lab
+    Description: KeyPair existente en us-east-1 (acceso SSH/RDP, no hay IAM role).
+
+  AllowedAdminCidr:
+    Type: String
+    Default: 0.0.0.0/0
+    AllowedPattern: '^([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]{1,2}$'
+    ConstraintDescription: CIDR valido, ej. 1.2.3.4/32
+    Description: Tu IP /32 para SSH(22) y RDP(3389). CAMBIALO.
+
+  TrendTenantId:
+    Type: String
+    Default: ''
+    NoEcho: true
+    Description: Tenant ID de Trend Micro Deep Security. Vacio = no se instala el agente.
+
+  TrendToken:
+    Type: String
+    Default: ''
+    NoEcho: true
+    Description: Token de activacion del agente de Trend Micro Deep Security.
+
+  ScriptBaseUrl:
+    Type: String
+    Default: https://raw.githubusercontent.com/t741712-afk/business-lab/main/scripts
+    Description: URL raw del repo con los scripts de provisioning.
+
+  DomainName:
+    Type: String
+    Default: corp.local
+    Description: Dominio AD interno.
+
+  WindowsAdminPassword:
+    Type: String
+    Default: BusinessLab#2026
+    NoEcho: true
+    Description: Password local de Administrator en las maquinas Windows.
+
+  AZ:
+    Type: AWS::EC2::AvailabilityZone::Name
+    Default: us-east-1a
+
+  AmiAmazonLinux:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+
+  GrafanaPassword:
+    Type: String
+    Default: Monitor#2026
+    NoEcho: true
+    Description: Password de admin de Grafana en el host de monitorizacion.
+
+  AmiWindows:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-windows-latest/Windows_Server-2022-English-Full-Base
+
+  K3sToken:
+    Type: String
+    NoEcho: true
+    Description: Token compartido por el master y los workers de k3s. Sin valor por defecto.
+
+  GroqApiKey:
+    Type: String
+    NoEcho: true
+    Description: API key de Groq (LLM del chatbot). Se guarda en el Secret ppf-ai-secrets.
+
+  TrendAiGuardApiKey:
+    Type: String
+    NoEcho: true
+    Description: API key de Trend Vision One AI Guard. Se guarda en el Secret ppf-ai-secrets.
+
+  FileSecurityApiKey:
+    Type: String
+    NoEcho: true
+    Description: API key de Trend Vision One File Security. Se guarda en el Secret ppf-ai-secrets.
+
+  VisionOneBootstrapToken:
+    Type: String
+    NoEcho: true
+    Description: Bootstrap Token de Vision One Container Security (Cloud Security > Container Security).
+
+  K3sInstanceType:
+    Type: String
+    Default: t3.medium
+    AllowedValues: [t3.small, t3.medium, t3.large]
+    Description: Tipo de instancia de los nodos k3s.
+
+  LatestUbuntu2404AmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/canonical/ubuntu/server/24.04/stable/current/amd64/hvm/ebs-gp3/ami-id
+    Description: AMI oficial mas reciente de Ubuntu Server 24.04 LTS (x86_64).
+
+Resources:
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags: [{ Key: Name, Value: business-lab-vpc }]
+
+  Igw:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags: [{ Key: Name, Value: business-lab-igw }]
+
+  IgwAttach:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref Igw
+
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.0.0.0/24
+      AvailabilityZone: !Ref AZ
+      MapPublicIpOnLaunch: true
+      Tags: [{ Key: Name, Value: dmz-public }]
+
+  PublicRt:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags: [{ Key: Name, Value: dmz-public-rt }]
+
+  PublicDefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: IgwAttach
+    Properties:
+      RouteTableId: !Ref PublicRt
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref Igw
+
+  PublicRtAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref PublicRt
+
+  NatEip:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+
+  NatGw:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatEip.AllocationId
+      SubnetId: !Ref PublicSubnet
+      Tags: [{ Key: Name, Value: business-lab-nat }]
+
+  # Route table privada compartida: el stack MZ asocia aqui sus subredes.
+  PrivateRt:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags: [{ Key: Name, Value: mz-private-rt }]
+
+  PrivateDefaultRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRt
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGw
+
+  # --- Security Groups -----------------------------------------------------
+  DmzSg:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: DMZ - web publico + admin restringido
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 80,   ToPort: 80,   CidrIp: 0.0.0.0/0 }
+        - { IpProtocol: tcp, FromPort: 443,  ToPort: 443,  CidrIp: 0.0.0.0/0 }
+        - { IpProtocol: tcp, FromPort: 22,   ToPort: 22,   CidrIp: !Ref AllowedAdminCidr }
+        - { IpProtocol: tcp, FromPort: 3389, ToPort: 3389, CidrIp: !Ref AllowedAdminCidr }
+        - { IpProtocol: tcp, FromPort: 3000, ToPort: 3000, CidrIp: !Ref AllowedAdminCidr }  # Grafana
+        - { IpProtocol: tcp, FromPort: 9090, ToPort: 9090, CidrIp: !Ref AllowedAdminCidr }  # Prometheus
+        - { IpProtocol: -1, CidrIp: 10.0.0.0/16 }   # intra-VPC libre (lab)
+      Tags: [{ Key: Name, Value: dmz-sg }]
+
+  ServiceGateway:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: c5.2xlarge
+      ImageId: 'ami-0c831944974e8124c'
+      KeyName: !Ref KeyName
+      NetworkInterfaces:
+        - DeviceIndex: "0"
+          AssociatePublicIpAddress: true
+          SubnetId: !Ref PublicSubnet
+          PrivateIpAddress: 10.0.0.75
+          GroupSet:
+              - !Ref DmzSg
+      MetadataOptions: { HttpTokens: required }
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs:
+            DeleteOnTermination: true
+            VolumeSize: 300
+            VolumeType: gp3
+            Encrypted: true
+      Tags:
+        - { Key: Name, Value: servicegateway }
+        - { Key: Zone, Value: dmz }
+
+  # Red MZ: una subred privada con salida a Internet por el NAT
+  MzSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Ref AZ
+      Tags: [{ Key: Name, Value: mz }]
+
+  MzRtAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref MzSubnet, RouteTableId: !Ref PrivateRt }
+
+  InternalSg:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: MZ interno - trafico libre dentro de la VPC
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - { IpProtocol: -1, CidrIp: 10.0.0.0/16 }
+      Tags: [{ Key: Name, Value: mz-internal-sg }]
+
+  DomainController:                       # DC1 - AD DS + DNS del dominio
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: t3.medium
+      ImageId: !Ref AmiWindows
+      KeyName: !Ref KeyName
+      SubnetId: !Ref MzSubnet
+      PrivateIpAddress: 10.0.1.10
+      SecurityGroupIds: [!Ref InternalSg]
+      MetadataOptions: { HttpTokens: required }
+      BlockDeviceMappings:
+        - { DeviceName: /dev/sda1, Ebs: { VolumeSize: 50, Encrypted: true, VolumeType: gp3 } }
+      Tags: [{ Key: Name, Value: dc1 }, { Key: Zone, Value: corp }]
+      UserData:
+        Fn::Base64: !Sub |
+          <powershell>
+          [Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12
+          $f="C:\prov.ps1"
+          for($i=0;$i -lt 10;$i++){ try{ Invoke-WebRequest "${ScriptBaseUrl}/dc1.ps1" -OutFile $f -UseBasicParsing; break }catch{ Start-Sleep 15 } }
+          if ("${TrendTenantId}" -ne "") {
+            $t = "C:\trend-agent.ps1"
+            Invoke-WebRequest "${ScriptBaseUrl}/trend-agent.ps1" -OutFile $t -UseBasicParsing
+            $a = New-ScheduledTaskAction -Execute "PowerShell.exe" -Argument "-ExecutionPolicy Bypass -File $t -TenantId ${TrendTenantId} -Token ${TrendToken}"
+            Register-ScheduledTask -TaskName TrendAgentInstall -Action $a -Trigger (New-ScheduledTaskTrigger -AtStartup) -User SYSTEM -RunLevel Highest -Force | Out-Null
+            powershell -ExecutionPolicy Bypass -File $t -TenantId "${TrendTenantId}" -Token "${TrendToken}"
+          }
+          powershell -ExecutionPolicy Bypass -File $f -DomainName "${DomainName}" -AdminPassword "${WindowsAdminPassword}"
+          </powershell>
+
+  # =========================================================================
+  # ===  ZTSA PRIVATE CONNECTOR  (red MZ 10.0.1.0/24)  =======================
+  # =========================================================================
+  # Adaptado de la plantilla de conector privado ZTSA (Japan). Cambios respecto al original:
+  # - Sin clave publica personal: acceso con el KeyPair del laboratorio.
+  # - Sin instalacion de SSM: el laboratorio no tiene IAM role.
+  # - SSH limitado a AllowedAdminCidr (el original abria 22 y 3389 a 0.0.0.0/0).
+  # - Disco cifrado e IMDSv2, como el resto de instancias (requisito PX).
+  ZtsaConnectorSg:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Conector privado ZTSA - acceso de administracion y trafico interno
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 22, ToPort: 22, CidrIp: !Ref AllowedAdminCidr }
+        - { IpProtocol: -1, CidrIp: 10.0.0.0/16 }
+      Tags: [{ Key: Name, Value: ztsa-connector-sg }]
+
+  ZtsaConnector:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: ami-0a520ca8b8a290243
+      InstanceType: c5.2xlarge
+      KeyName: !Ref KeyName
+      SubnetId: !Ref MzSubnet
+      PrivateIpAddress: 10.0.1.16
+      SecurityGroupIds: [!Ref ZtsaConnectorSg]
+      MetadataOptions: { HttpTokens: required }
+      BlockDeviceMappings:
+        - { DeviceName: /dev/xvda, Ebs: { VolumeSize: 50, Encrypted: true, VolumeType: gp3 } }
+      Tags:
+        - { Key: Name, Value: ztsa-private-connector }
+        - { Key: Zone, Value: ops }
+        - { Key: Environment, Value: Lab }
+
+  Monitor:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: t3.medium
+      ImageId: !Ref AmiAmazonLinux
+      KeyName: !Ref KeyName
+      SubnetId: !Ref PublicSubnet
+      PrivateIpAddress: 10.0.0.40
+      SecurityGroupIds: [!Ref DmzSg]
+      MetadataOptions: { HttpTokens: required }
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs: { VolumeSize: 30, Encrypted: true, VolumeType: gp3 }
+      Tags:
+        - { Key: Name, Value: monitor }
+        - { Key: Zone, Value: dmz }
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          # monitor provisioning v2 (Grafana HTTPS en 443)
+          exec > /var/log/bootstrap.log 2>&1
+          for i in $(seq 1 10); do curl -fsSL "${ScriptBaseUrl}/monitor.sh" -o /tmp/p.sh && break; sleep 15; done
+          chmod +x /tmp/p.sh; GF_PASS="${GrafanaPassword}" bash /tmp/p.sh
+
+  # Frontal IIS corporativo: portal de subida, trace.axd y /backup con listado
+  WebIis:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: t3.medium
+      ImageId: !Ref AmiWindows
+      KeyName: !Ref KeyName
+      SubnetId: !Ref PublicSubnet
+      PrivateIpAddress: 10.0.0.35
+      SecurityGroupIds: [!Ref DmzSg]
+      MetadataOptions: { HttpTokens: required }
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs: { VolumeSize: 50, Encrypted: true, VolumeType: gp3 }
+      Tags:
+        - { Key: Name, Value: web-iis }
+        - { Key: Zone, Value: dmz }
+      UserData:
+        Fn::Base64: !Sub |
+          <powershell>
+          [Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12
+          $f="C:\prov.ps1"
+          for($i=0;$i -lt 10;$i++){ try{ Invoke-WebRequest "${ScriptBaseUrl}/web-iis.ps1" -OutFile $f -UseBasicParsing; break }catch{ Start-Sleep 15 } }
+          powershell -ExecutionPolicy Bypass -File $f -AdminPassword "${WindowsAdminPassword}"
+          if ("${TrendTenantId}" -ne "") {
+            $t = "C:\trend-agent.ps1"
+            Invoke-WebRequest "${ScriptBaseUrl}/trend-agent.ps1" -OutFile $t -UseBasicParsing
+            powershell -ExecutionPolicy Bypass -File $t -TenantId "${TrendTenantId}" -Token "${TrendToken}"
+          }
+          </powershell>
+
+  # Frontal Apache + PHP con LFI, subida sin validar, diagnostico con comandos y phpinfo
+  WebApachePhp:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: t3.small
+      ImageId: !Ref AmiAmazonLinux
+      KeyName: !Ref KeyName
+      SubnetId: !Ref PublicSubnet
+      PrivateIpAddress: 10.0.0.33
+      SecurityGroupIds: [!Ref DmzSg]
+      MetadataOptions: { HttpTokens: required }
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs: { VolumeSize: 20, Encrypted: true, VolumeType: gp3 }
+      Tags:
+        - { Key: Name, Value: web-apache-php }
+        - { Key: Zone, Value: dmz }
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          exec > /var/log/bootstrap.log 2>&1
+          for i in $(seq 1 10); do curl -fsSL "${ScriptBaseUrl}/web-apache-php.sh" -o /tmp/p.sh && break; sleep 15; done
+          chmod +x /tmp/p.sh; bash /tmp/p.sh
+          if [ -n "${TrendTenantId}" ]; then
+            for i in $(seq 1 10); do curl -fsSL "${ScriptBaseUrl}/trend-agent.sh" -o /tmp/trend.sh && break; sleep 15; done
+            bash /tmp/trend.sh "${TrendTenantId}" "${TrendToken}" || echo "trend-agent: fallo la instalacion" >> /var/log/bootstrap.log
+          fi
+
+  # ===========================================================================
+  #  CLUSTER k3s  (master en la DMZ, workers en la MZ)
+  # ===========================================================================
+  K3sSg:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: k3s - web publica (30080, 30081) y API solo desde administracion
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 22,    ToPort: 22,    CidrIp: !Ref AllowedAdminCidr }
+        - { IpProtocol: tcp, FromPort: 6443,  ToPort: 6443,  CidrIp: !Ref AllowedAdminCidr }
+        - { IpProtocol: tcp, FromPort: 30080, ToPort: 30080, CidrIp: 0.0.0.0/0 }   # web + admin (ingress)
+        - { IpProtocol: tcp, FromPort: 30081, ToPort: 30081, CidrIp: 0.0.0.0/0 }   # pgAdmin
+        - { IpProtocol: -1, CidrIp: 10.0.0.0/16 }                                  # trafico interno k3s
+      SecurityGroupEgress:
+        - { IpProtocol: "-1", CidrIp: 0.0.0.0/0 }
+      Tags: [{ Key: Name, Value: k3s-sg }]
+
+  K3sMaster:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref K3sInstanceType
+      ImageId: !Ref LatestUbuntu2404AmiId
+      KeyName: !Ref KeyName
+      SubnetId: !Ref PublicSubnet
+      PrivateIpAddress: 10.0.0.50
+      SecurityGroupIds: [!Ref K3sSg]
+      MetadataOptions: { HttpTokens: required }
+      BlockDeviceMappings:
+        - { DeviceName: /dev/sda1, Ebs: { VolumeSize: 60, Encrypted: true, VolumeType: gp3, DeleteOnTermination: true } }
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -euo pipefail
+          exec > >(tee /var/log/k3s-install.log | logger -t k3s-install) 2>&1
+
+          export DEBIAN_FRONTEND=noninteractive
+          echo "==> Updating system packages"
+          apt-get update
+          apt-get upgrade -y
+
+          echo "==> Installing utilities and Docker"
+          apt-get install -y ca-certificates curl git tar bash-completion docker.io
+
+          echo "==> Reading public IP from instance metadata (IMDSv2)"
+          IMDS_TOKEN=$(curl -sX PUT http://169.254.169.254/latest/api/token -H "X-aws-ec2-metadata-token-ttl-seconds: 300")
+          PUBIP=$(curl -s -H "X-aws-ec2-metadata-token: $IMDS_TOKEN" http://169.254.169.254/latest/meta-data/public-ipv4)
+
+          echo "==> Installing k3s master"
+          curl -sfL https://get.k3s.io | K3S_TOKEN="${K3sToken}" sh -s - \
+            --write-kubeconfig-mode 644 \
+            --disable traefik \
+            --tls-san 10.0.0.50 \
+            --tls-san "$PUBIP"
+
+          echo "==> Waiting for k3s to be ready"
+          until kubectl get nodes 2>/dev/null | grep -q " Ready"; do
+            sleep 5
+          done
+
+          echo "==> kubectl completion and aliases"
+          mkdir -p /etc/bash_completion.d
+          kubectl completion bash > /etc/bash_completion.d/kubectl
+          printf '\nalias k=kubectl\n' >> /home/ubuntu/.bashrc
+          printf 'source /etc/bash_completion.d/kubectl\n' >> /home/ubuntu/.bashrc
+
+          echo "==> Kubeconfig for ubuntu"
+          mkdir -p /home/ubuntu/.kube
+          install -o ubuntu -g ubuntu -m 600 /etc/rancher/k3s/k3s.yaml /home/ubuntu/.kube/config
+
+          echo "==> Enabling Docker"
+          systemctl enable --now docker
+          usermod -aG docker ubuntu
+
+          echo "==> Cloning repo and building images (the master also runs app pods)"
+          git clone https://github.com/t741712-afk/k8-web-politica.git /home/ubuntu/partido-app
+          chown -R ubuntu:ubuntu /home/ubuntu/partido-app
+          docker build -t ppf-backend:latest     /home/ubuntu/partido-app/backend
+          docker build -t ppf-frontend:latest    /home/ubuntu/partido-app/frontend
+          docker build -t ppf-admin:latest       /home/ubuntu/partido-app/admin
+          docker build -t ppf-ai-backend:latest  /home/ubuntu/partido-app/ai-backend
+          docker build -t ppf-ai-frontend:latest /home/ubuntu/partido-app/ai-frontend
+          docker save ppf-backend:latest     | k3s ctr images import -
+          docker save ppf-frontend:latest    | k3s ctr images import -
+          docker save ppf-admin:latest       | k3s ctr images import -
+          docker save ppf-ai-backend:latest  | k3s ctr images import -
+          docker save ppf-ai-frontend:latest | k3s ctr images import -
+
+          echo "==> Deploying PPF app"
+          chmod +x /home/ubuntu/partido-app/deploy.sh
+          /home/ubuntu/partido-app/deploy.sh
+
+          echo "==> Creating AI secret (ppf-ai-secrets) and restarting the AI backend"
+          export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+          kubectl create namespace ppf --dry-run=client -o yaml | kubectl apply -f -
+          kubectl create secret generic ppf-ai-secrets -n ppf --dry-run=client -o yaml \
+            --from-literal=GROQ_API_KEY="${GroqApiKey}" \
+            --from-literal=TREND_API_KEY="${TrendAiGuardApiKey}" \
+            --from-literal=FILE_SECURITY_API_KEY="${FileSecurityApiKey}" | kubectl apply -f -
+          kubectl rollout restart deployment/ppf-ai-backend -n ppf
+
+          echo "==> Installing Vision One Container Security"
+          cat > /home/ubuntu/overrides.yaml <<'EOF'
+          visionOne:
+            bootstrapToken: ${VisionOneBootstrapToken}
+            endpoint: https://api.eu.xdr.trendmicro.com/external/v2/direct/vcs/external/vcs
+            exclusion:
+              namespaces: [kube-system]
+            runtimeSecurity:
+              enabled: true
+            vulnerabilityScanning:
+              enabled: true
+            malwareScanning:
+              enabled: true
+            secretScanning:
+              enabled: true
+            fileIntegrityMonitoring:
+              enabled: true
+          auditLogCollection:
+            enabled: true
+            provider: selfManaged
+          EOF
+          helm install trendmicro \
+            --namespace trendmicro-system --create-namespace \
+            --values /home/ubuntu/overrides.yaml \
+            https://github.com/trendmicro/visionone-container-security-helm/archive/main.tar.gz
+
+          echo "==> Master ready"
+      Tags:
+        - { Key: Name, Value: k3s-master }
+        - { Key: Role, Value: master }
+
+  K3sWorker1:
+    Type: AWS::EC2::Instance
+    DependsOn: K3sMaster
+    Properties:
+      InstanceType: !Ref K3sInstanceType
+      ImageId: !Ref LatestUbuntu2404AmiId
+      KeyName: !Ref KeyName
+      SubnetId: !Ref MzSubnet
+      PrivateIpAddress: 10.0.1.51
+      SecurityGroupIds: [!Ref K3sSg]
+      MetadataOptions: { HttpTokens: required }
+      BlockDeviceMappings:
+        - { DeviceName: /dev/sda1, Ebs: { VolumeSize: 60, Encrypted: true, VolumeType: gp3, DeleteOnTermination: true } }
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -euo pipefail
+          exec > >(tee /var/log/k3s-worker-install.log | logger -t k3s-worker) 2>&1
+
+          export DEBIAN_FRONTEND=noninteractive
+          echo "==> Updating system packages"
+          apt-get update
+          apt-get upgrade -y
+
+          echo "==> Installing utilities and Docker"
+          apt-get install -y ca-certificates curl git tar bash-completion docker.io
+
+          echo "==> Enabling Docker"
+          systemctl enable --now docker
+
+          echo "==> Cloning repo and building images"
+          git clone https://github.com/t741712-afk/k8-web-politica.git /home/ubuntu/partido-app
+          docker build -t ppf-backend:latest     /home/ubuntu/partido-app/backend
+          docker build -t ppf-frontend:latest    /home/ubuntu/partido-app/frontend
+          docker build -t ppf-admin:latest       /home/ubuntu/partido-app/admin
+          docker build -t ppf-ai-backend:latest  /home/ubuntu/partido-app/ai-backend
+          docker build -t ppf-ai-frontend:latest /home/ubuntu/partido-app/ai-frontend
+
+          echo "==> Waiting for master API to be reachable"
+          until curl -sk --max-time 5 https://10.0.0.50:6443/healthz; do
+            echo "Master not ready yet, retrying in 10s..."
+            sleep 10
+          done
+
+          echo "==> Joining k3s cluster as worker-1"
+          curl -sfL https://get.k3s.io | \
+            K3S_URL="https://10.0.0.50:6443" \
+            K3S_TOKEN="${K3sToken}" \
+            sh -
+
+          echo "==> Importing images into k3s"
+          docker save ppf-backend:latest     | k3s ctr images import -
+          docker save ppf-frontend:latest    | k3s ctr images import -
+          docker save ppf-admin:latest       | k3s ctr images import -
+          docker save ppf-ai-backend:latest  | k3s ctr images import -
+          docker save ppf-ai-frontend:latest | k3s ctr images import -
+
+          echo "==> Worker-1 ready"
+      Tags:
+        - { Key: Name, Value: k3s-worker-1 }
+        - { Key: Role, Value: worker }
+
+  K3sWorker2:
+    Type: AWS::EC2::Instance
+    DependsOn: K3sMaster
+    Properties:
+      InstanceType: !Ref K3sInstanceType
+      ImageId: !Ref LatestUbuntu2404AmiId
+      KeyName: !Ref KeyName
+      SubnetId: !Ref MzSubnet
+      PrivateIpAddress: 10.0.1.52
+      SecurityGroupIds: [!Ref K3sSg]
+      MetadataOptions: { HttpTokens: required }
+      BlockDeviceMappings:
+        - { DeviceName: /dev/sda1, Ebs: { VolumeSize: 60, Encrypted: true, VolumeType: gp3, DeleteOnTermination: true } }
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -euo pipefail
+          exec > >(tee /var/log/k3s-worker-install.log | logger -t k3s-worker) 2>&1
+
+          export DEBIAN_FRONTEND=noninteractive
+          echo "==> Updating system packages"
+          apt-get update
+          apt-get upgrade -y
+
+          echo "==> Installing utilities and Docker"
+          apt-get install -y ca-certificates curl git tar bash-completion docker.io
+
+          echo "==> Enabling Docker"
+          systemctl enable --now docker
+
+          echo "==> Cloning repo and building images"
+          git clone https://github.com/t741712-afk/k8-web-politica.git /home/ubuntu/partido-app
+          docker build -t ppf-backend:latest     /home/ubuntu/partido-app/backend
+          docker build -t ppf-frontend:latest    /home/ubuntu/partido-app/frontend
+          docker build -t ppf-admin:latest       /home/ubuntu/partido-app/admin
+          docker build -t ppf-ai-backend:latest  /home/ubuntu/partido-app/ai-backend
+          docker build -t ppf-ai-frontend:latest /home/ubuntu/partido-app/ai-frontend
+
+          echo "==> Waiting for master API to be reachable"
+          until curl -sk --max-time 5 https://10.0.0.50:6443/healthz; do
+            echo "Master not ready yet, retrying in 10s..."
+            sleep 10
+          done
+
+          echo "==> Joining k3s cluster as worker-2"
+          curl -sfL https://get.k3s.io | \
+            K3S_URL="https://10.0.0.50:6443" \
+            K3S_TOKEN="${K3sToken}" \
+            sh -
+
+          echo "==> Importing images into k3s"
+          docker save ppf-backend:latest     | k3s ctr images import -
+          docker save ppf-frontend:latest    | k3s ctr images import -
+          docker save ppf-admin:latest       | k3s ctr images import -
+          docker save ppf-ai-backend:latest  | k3s ctr images import -
+          docker save ppf-ai-frontend:latest | k3s ctr images import -
+
+          echo "==> Worker-2 ready"
+      Tags:
+        - { Key: Name, Value: k3s-worker-2 }
+        - { Key: Role, Value: worker }
+
+Outputs:
+  VpcId:
+    Value: !Ref Vpc
+  ServiceGatewayIp:
+    Description: IP publica del Service Gateway (SSH como admin).
+    Value: !GetAtt ServiceGateway.PublicIp
+  MonitorIp:
+    Value: !GetAtt Monitor.PublicIp
+  GrafanaUrl:
+    Description: Dashboard de estado de servicios (HTTPS/443, cert autofirmado).
+    Value: !Sub "https://${Monitor.PublicIp}/"
+  K3sMasterPublicIP:
+    Description: IP publica del master k3s (SSH, kubectl y web)
+    Value: !GetAtt K3sMaster.PublicIp
+  K3sWebURL:
+    Description: URL de la web PPF
+    Value: !Sub "http://${K3sMaster.PublicIp}:30080/"
+  K3sAdminURL:
+    Description: URL del panel de administracion
+    Value: !Sub "http://${K3sMaster.PublicIp}:30080/admin"
+  K3spgAdminURL:
+    Description: URL de pgAdmin
+    Value: !Sub "http://${K3sMaster.PublicIp}:30081/"
+  WebApachePhpIp:
+    Description: IP publica del frontal Apache + PHP
+    Value: !GetAtt WebApachePhp.PublicIp
+  K3sSSHMaster:
+    Description: SSH al master k3s
+    Value: !Sub "ssh -i ${KeyName}.pem ubuntu@${K3sMaster.PublicIp}"
